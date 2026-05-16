@@ -1,38 +1,51 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid,
+  Tooltip, ResponsiveContainer, ReferenceLine,
+} from 'recharts';
 import SimLayout from '@/components/SimLayout';
 import { rand } from '@/lib/rng';
 
-const BTN = 'border border-black/15 rounded-lg px-4 py-2 text-sm hover:bg-[#f0f0f0] cursor-pointer';
-
-const DENSITY_MAP = { 낮음: 0.3, 중간: 0.5, 높음: 0.7 };
-type Density = keyof typeof DENSITY_MAP;
-
 type Bridge = { row: number; col: number };
+type Step = 'setup' | 'select' | 'simulating' | 'result';
 
-function buildLadder(players: number, rows: number, density: number): Bridge[] {
+const ROWS = 12;
+const CW = 480;
+const CH = 400;
+const MX = 50;
+const MY = 40;
+
+function colX(c: number, n: number): number {
+  return MX + c * ((CW - 2 * MX) / (n - 1));
+}
+function rowY(r: number): number {
+  return MY + r * ((CH - 2 * MY) / ROWS);
+}
+
+function generateLadder(n: number): Bridge[] {
   const bridges: Bridge[] = [];
-  for (let r = 0; r < rows; r++) {
+  for (let r = 0; r < ROWS; r++) {
     let c = 0;
-    while (c < players - 1) {
-      if (rand() < density) {
-        if (!bridges.find((b) => b.row === r && b.col === c - 1)) {
+    while (c < n - 1) {
+      if (rand() < 0.45) {
+        if (!bridges.some(b => b.row === r && b.col === c - 1)) {
           bridges.push({ row: r, col: c });
           c += 2;
-        } else { c++; }
-      } else { c++; }
+        } else c++;
+      } else c++;
     }
   }
   return bridges;
 }
 
-function tracePath(start: number, players: number, rows: number, bridges: Bridge[]): number[] {
-  const path: number[] = [start];
-  let col = start;
-  for (let r = 0; r < rows; r++) {
-    const left  = bridges.find((b) => b.row === r && b.col === col - 1);
-    const right = bridges.find((b) => b.row === r && b.col === col);
+function tracePath(bridges: Bridge[], startCol: number): number[] {
+  const path = [startCol];
+  let col = startCol;
+  for (let r = 0; r < ROWS; r++) {
+    const right = bridges.find(b => b.row === r && b.col === col);
+    const left  = bridges.find(b => b.row === r && b.col === col - 1);
     if (right) col++;
     else if (left) col--;
     path.push(col);
@@ -40,123 +53,452 @@ function tracePath(start: number, players: number, rows: number, bridges: Bridge
   return path;
 }
 
+function makeShuffled(n: number): number[] {
+  const arr = Array.from({ length: n }, (_, i) => i);
+  for (let i = n - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+const BTN = 'border border-black/15 rounded-lg px-4 py-2 text-sm hover:bg-[#f0f0f0] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed';
+const INPUT_CLS = 'border border-black/15 rounded-lg px-3 py-2 w-full text-sm focus:outline-none focus:border-[#534AB7]';
+
 export default function LadderPage() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [players, setPlayers] = useState(4);
-  const [density, setDensity] = useState<Density>('중간');
-  const [bridges, setBridges] = useState<Bridge[]>([]);
-  const [results, setResults] = useState<number[]>([]);
-  const [selectedPlayer, setSelectedPlayer] = useState<number | null>(null);
-  const [highlightPath, setHighlightPath] = useState<number[] | null>(null);
-  const ROWS = 10;
+  const rafRef    = useRef(0);
 
-  const drawLadder = useCallback(() => {
+  // Animation refs (read inside RAF without stale closure issues)
+  const allSimsRef      = useRef<{ bridges: Bridge[]; path: number[] }[]>([]);
+  const animIdxRef      = useRef(0);
+  const animPStepRef    = useRef(0); // path step within current sim (0..ROWS)
+  const spfRef          = useRef(1); // steps per frame
+  const animRunningRef  = useRef(false);
+  const ladderCntRef    = useRef(4);
+  const destRef         = useRef<number[]>([]);
+  const selIdxRef       = useRef<number | null>(null);
+  const tallyRef        = useRef<number[]>([]);
+
+  const [step,        setStep]        = useState<Step>('setup');
+  const [ladderCount, setLadderCount] = useState(4);
+  const [simCount,    setSimCount]    = useState(100);
+  const [lcError,     setLcError]     = useState('');
+  const [scError,     setScError]     = useState('');
+
+  const [fixedBridges, setFixedBridges] = useState<Bridge[]>([]);
+  const [destinations, setDestinations] = useState<number[]>([]);
+  const [selectedIdx,  setSelectedIdx]  = useState<number | null>(null);
+
+  const [tally,       setTally]       = useState<number[]>([]);
+  const [lastBridges, setLastBridges] = useState<Bridge[]>([]);
+  const [lastPath,    setLastPath]    = useState<number[]>([]);
+  const [animProg,    setAnimProg]    = useState({ cur: 0, total: 0 });
+
+  // ── Canvas drawing ───────────────────────────────────────────────────────
+  const drawLadder = useCallback((
+    bridges: Bridge[], n: number, dests: number[],
+    selected: number | null,
+    path: number[] | null,
+    pStep?: number, // if defined: animate; draw path up to this step + moving dot
+  ) => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas || n < 2) return;
     const ctx = canvas.getContext('2d')!;
-    const W = canvas.width, H = canvas.height;
-    const marginX = 40, marginY = 30;
-    const innerW = W - marginX * 2, innerH = H - marginY * 2;
-    const colW = innerW / (players - 1), rowH = innerH / ROWS;
+    ctx.clearRect(0, 0, CW, CH);
+    ctx.fillStyle = '#fafaf8';
+    ctx.fillRect(0, 0, CW, CH);
 
-    ctx.clearRect(0, 0, W, H);
-    function colX(c: number) { return marginX + c * colW; }
-    function rowY(r: number) { return marginY + r * rowH; }
-
-    for (let c = 0; c < players; c++) {
-      ctx.beginPath(); ctx.moveTo(colX(c), rowY(0)); ctx.lineTo(colX(c), rowY(ROWS));
-      ctx.strokeStyle = '#ccc'; ctx.lineWidth = 2; ctx.stroke();
+    // Columns
+    for (let c = 0; c < n; c++) {
+      ctx.beginPath();
+      ctx.moveTo(colX(c, n), rowY(0));
+      ctx.lineTo(colX(c, n), rowY(ROWS));
+      ctx.strokeStyle = selected === c ? '#534AB7' : '#ccc';
+      ctx.lineWidth   = selected === c ? 3 : 2;
+      ctx.stroke();
     }
+
+    // Bridges
     for (const b of bridges) {
-      ctx.beginPath(); ctx.moveTo(colX(b.col), rowY(b.row + 0.5)); ctx.lineTo(colX(b.col + 1), rowY(b.row + 0.5));
-      ctx.strokeStyle = '#888'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(colX(b.col,     n), rowY(b.row + 0.5));
+      ctx.lineTo(colX(b.col + 1, n), rowY(b.row + 0.5));
+      ctx.strokeStyle = '#aaa';
+      ctx.lineWidth   = 2;
+      ctx.stroke();
     }
-    if (highlightPath && selectedPlayer !== null) {
-      for (let r = 0; r <= ROWS; r++) {
-        const col = highlightPath[r], col2 = r < ROWS ? highlightPath[r + 1] : null;
-        ctx.beginPath(); ctx.arc(colX(col), rowY(r), 5, 0, Math.PI * 2);
-        ctx.fillStyle = '#534AB7'; ctx.fill();
-        if (col2 !== null && col2 !== col) {
-          const halfRow = rowY(r + 0.5);
-          ctx.beginPath(); ctx.moveTo(colX(col), rowY(r)); ctx.lineTo(colX(col), halfRow);
-          ctx.lineTo(colX(col2), halfRow); ctx.lineTo(colX(col2), rowY(r + 1));
-          ctx.strokeStyle = '#534AB7'; ctx.lineWidth = 3; ctx.stroke();
-        } else if (col2 !== null) {
-          ctx.beginPath(); ctx.moveTo(colX(col), rowY(r)); ctx.lineTo(colX(col), rowY(r + 1));
-          ctx.strokeStyle = '#534AB7'; ctx.lineWidth = 3; ctx.stroke();
+
+    // Path segments
+    if (path) {
+      const limit = pStep !== undefined ? pStep : path.length - 1;
+      ctx.strokeStyle = '#E24B4A';
+      ctx.lineWidth   = 3;
+      for (let r = 0; r < Math.min(limit, path.length - 1); r++) {
+        const fc = path[r], tc = path[r + 1];
+        const y1 = rowY(r), y2 = rowY(r + 1), ym = rowY(r + 0.5);
+        if (fc === tc) {
+          ctx.beginPath(); ctx.moveTo(colX(fc, n), y1); ctx.lineTo(colX(tc, n), y2); ctx.stroke();
+        } else {
+          ctx.beginPath(); ctx.moveTo(colX(fc, n), y1);  ctx.lineTo(colX(fc, n), ym); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(colX(fc, n), ym);  ctx.lineTo(colX(tc, n), ym); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(colX(tc, n), ym);  ctx.lineTo(colX(tc, n), y2); ctx.stroke();
+        }
+      }
+
+      if (pStep !== undefined) {
+        // Moving dot (current position during animation)
+        const curCol = path[Math.min(pStep, ROWS)];
+        ctx.beginPath();
+        ctx.arc(colX(curCol, n), rowY(Math.min(pStep, ROWS)), 7, 0, Math.PI * 2);
+        ctx.fillStyle   = '#E24B4A';
+        ctx.fill();
+        ctx.strokeStyle = 'white';
+        ctx.lineWidth   = 2;
+        ctx.stroke();
+      } else {
+        // Arrival dot (result view)
+        const dc = path[path.length - 1];
+        ctx.beginPath();
+        ctx.arc(colX(dc, n), rowY(ROWS), 10, 0, Math.PI * 2);
+        ctx.fillStyle = '#E24B4A';
+        ctx.fill();
+      }
+    }
+
+    ctx.font = 'bold 13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    // ▼ indicator
+    if (selected !== null) {
+      ctx.fillStyle = '#534AB7';
+      ctx.font      = '14px sans-serif';
+      ctx.fillText('▼', colX(selected, n), rowY(0) - 36);
+      ctx.font      = 'bold 13px sans-serif';
+    }
+
+    // Top circles
+    for (let c = 0; c < n; c++) {
+      ctx.beginPath();
+      ctx.arc(colX(c, n), rowY(0) - 18, 13, 0, Math.PI * 2);
+      ctx.fillStyle   = selected === c ? '#534AB7' : '#EEEDFE';
+      ctx.fill();
+      ctx.strokeStyle = '#534AB7'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle   = selected === c ? 'white' : '#534AB7';
+      ctx.fillText(String(c + 1), colX(c, n), rowY(0) - 18);
+    }
+
+    // Bottom circles
+    const finalCol = path && pStep === undefined ? path[path.length - 1] : null;
+    for (let c = 0; c < n; c++) {
+      const isArrival = finalCol === c;
+      ctx.beginPath();
+      ctx.arc(colX(c, n), rowY(ROWS) + 18, 13, 0, Math.PI * 2);
+      ctx.fillStyle   = isArrival ? '#E24B4A' : '#f8f8f6';
+      ctx.fill();
+      ctx.strokeStyle = isArrival ? '#E24B4A' : '#ccc';
+      ctx.lineWidth   = isArrival ? 2 : 1.5; ctx.stroke();
+      ctx.fillStyle   = isArrival ? 'white' : '#666';
+      const label = dests.length > c ? dests[c] + 1 : c + 1;
+      ctx.fillText(String(label), colX(c, n), rowY(ROWS) + 18);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (step === 'select') {
+      drawLadder(fixedBridges, ladderCount, destinations, selectedIdx, null);
+    } else if (step === 'result') {
+      drawLadder(lastBridges, ladderCount, destinations, selectedIdx, lastPath);
+    }
+  }, [step, fixedBridges, ladderCount, destinations, selectedIdx, lastBridges, lastPath, drawLadder]);
+
+  // ── Animation loop (latest-ref pattern) ─────────────────────────────────
+  const animFnRef = useRef<() => void>(() => {});
+  animFnRef.current = () => {
+    if (!animRunningRef.current) return;
+
+    const sims  = allSimsRef.current;
+    const n     = ladderCntRef.current;
+    const dests = destRef.current;
+    const sel   = selIdxRef.current;
+    const prevIdx = animIdxRef.current;
+
+    let pStep = animPStepRef.current;
+    let idx   = animIdxRef.current;
+
+    for (let i = 0; i < spfRef.current; i++) {
+      pStep++;
+      if (pStep > ROWS) {
+        pStep = 0;
+        idx++;
+        if (idx >= sims.length) {
+          // All simulations done → transition to result
+          animRunningRef.current = false;
+          const last = sims[sims.length - 1];
+          setLastBridges(last.bridges);
+          setLastPath(last.path);
+          setTally([...tallyRef.current]);
+          setAnimProg({ cur: sims.length, total: sims.length });
+          setStep('result');
+          return;
         }
       }
     }
-    ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center';
-    for (let c = 0; c < players; c++) {
-      ctx.fillStyle = selectedPlayer === c ? '#534AB7' : '#111';
-      ctx.fillText(String(c + 1), colX(c), marginY - 10);
+
+    animPStepRef.current = pStep;
+    animIdxRef.current   = idx;
+
+    // Draw current sim
+    const { bridges, path } = sims[idx];
+    drawLadder(bridges, n, dests, sel, path, pStep);
+
+    // Update progress counter only when sim index changes
+    if (idx !== prevIdx) {
+      setAnimProg({ cur: idx + 1, total: sims.length });
     }
-    for (let c = 0; c < players; c++) {
-      ctx.fillStyle = '#111';
-      ctx.fillText(String(results[c] !== undefined ? results[c] + 1 : ''), colX(c), rowY(ROWS) + 18);
+
+    rafRef.current = requestAnimationFrame(() => animFnRef.current());
+  };
+
+  // ── Handlers ─────────────────────────────────────────────────────────────
+  function validate(): boolean {
+    let ok = true;
+    if (!Number.isInteger(ladderCount) || ladderCount < 2 || ladderCount > 8) {
+      setLcError('2~8 사이의 정수를 입력하세요'); ok = false;
+    } else setLcError('');
+    if (!Number.isInteger(simCount) || simCount < 10 || simCount > 10000) {
+      setScError('10~10000 사이의 정수를 입력하세요'); ok = false;
+    } else setScError('');
+    return ok;
+  }
+
+  function startGame() {
+    if (!validate()) return;
+    setFixedBridges(generateLadder(ladderCount));
+    setDestinations(makeShuffled(ladderCount));
+    setSelectedIdx(null);
+    setStep('select');
+  }
+
+  function confirmSelection() {
+    if (selectedIdx === null) return;
+
+    // Pre-compute all simulations
+    const dests = destinations;
+    const sims = Array.from({ length: simCount }, () => {
+      const bridges = generateLadder(ladderCount);
+      const path    = tracePath(bridges, selectedIdx);
+      return { bridges, path };
+    });
+
+    // Compute tally upfront
+    const counts = Array<number>(ladderCount).fill(0);
+    for (const { path } of sims) counts[dests[path[path.length - 1]]]++;
+    tallyRef.current = counts;
+
+    // Set animation refs
+    allSimsRef.current   = sims;
+    animIdxRef.current   = 0;
+    animPStepRef.current = 0;
+    ladderCntRef.current = ladderCount;
+    destRef.current      = dests;
+    selIdxRef.current    = selectedIdx;
+    // Target ~6 seconds (360 frames at 60fps)
+    spfRef.current = Math.max(1, Math.ceil((simCount * ROWS) / 360));
+    animRunningRef.current = true;
+
+    setAnimProg({ cur: 1, total: simCount });
+    setStep('simulating');
+    rafRef.current = requestAnimationFrame(() => animFnRef.current());
+  }
+
+  function skipAnimation() {
+    animRunningRef.current = false;
+    cancelAnimationFrame(rafRef.current);
+    const sims = allSimsRef.current;
+    const last = sims[sims.length - 1];
+    setLastBridges(last.bridges);
+    setLastPath(last.path);
+    setTally([...tallyRef.current]);
+    setStep('result');
+  }
+
+  function handleCanvasClick(e: React.MouseEvent<HTMLCanvasElement>) {
+    if (step !== 'select') return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect  = canvas.getBoundingClientRect();
+    const cx    = (e.clientX - rect.left) * (CW / rect.width);
+    let closest = 0, minD = Infinity;
+    for (let c = 0; c < ladderCount; c++) {
+      const d = Math.abs(cx - colX(c, ladderCount));
+      if (d < minD) { minD = d; closest = c; }
     }
-  }, [players, bridges, highlightPath, selectedPlayer, results, ROWS]);
-
-  useEffect(() => { drawLadder(); }, [drawLadder]);
-
-  function generate() {
-    setBridges(buildLadder(players, ROWS, DENSITY_MAP[density]));
-    setResults([]); setSelectedPlayer(null); setHighlightPath(null);
+    if (minD < 60) setSelectedIdx(closest);
   }
 
-  function selectPlayer(p: number) {
-    setSelectedPlayer(p);
-    const path = tracePath(p, players, ROWS, bridges);
-    setHighlightPath(path);
-    setResults((prev) => { const next = [...prev]; next[p] = path[path.length - 1]; return next; });
-  }
+  useEffect(() => () => { animRunningRef.current = false; cancelAnimationFrame(rafRef.current); }, []);
 
-  function showAll() {
-    setResults(Array.from({ length: players }, (_, i) => tracePath(i, players, ROWS, bridges)[ROWS]));
-    setHighlightPath(null); setSelectedPlayer(null);
-  }
+  // ── Chart data ───────────────────────────────────────────────────────────
+  const maxCount      = tally.length ? Math.max(...tally) : 0;
+  const topIdx        = tally.length ? tally.indexOf(maxCount) : 0;
+  const chartData     = Array.from({ length: ladderCount }, (_, i) => ({
+    name:  `${i + 1}번`,
+    count: tally[i] ?? 0,
+    isMax: tally.length > 0 && (tally[i] ?? 0) === maxCount && maxCount > 0,
+  }));
+  const theoreticalAvg = simCount / ladderCount;
 
+  // ── Render ───────────────────────────────────────────────────────────────
   return (
-    <SimLayout title="11 — 사다리타기" description="랜덤 다리 생성 후 참가자를 클릭하면 경로를 추적합니다.">
-      <div className="grid grid-cols-2 gap-4 mb-4">
-        <div>
-          <label className="text-sm text-[#666] block mb-1">참가자 수: {players}</label>
-          <input type="range" min={2} max={8} value={players}
-            onChange={(e) => { setPlayers(+e.target.value); setBridges([]); setResults([]); setHighlightPath(null); }}
-            className="w-full" />
+    <SimLayout title="11 — 사다리타기" description="사다리를 선택하고 결과가 얼마나 고른지 확인해보세요.">
+
+      {/* STEP 1: 설정 */}
+      {step === 'setup' && (
+        <div className="max-w-sm">
+          <div className="space-y-4 mb-6">
+            <div>
+              <label className="text-sm text-[#666] block mb-1">사다리 수 (2~8)</label>
+              <input type="number" min={2} max={8} value={ladderCount}
+                onChange={e => setLadderCount(+e.target.value)} className={INPUT_CLS} />
+              {lcError && <p className="text-xs text-[#E24B4A] mt-1">{lcError}</p>}
+            </div>
+            <div>
+              <label className="text-sm text-[#666] block mb-1">시뮬레이션 횟수 (10~10000)</label>
+              <input type="number" min={10} max={10000} value={simCount}
+                onChange={e => setSimCount(+e.target.value)} className={INPUT_CLS} />
+              {scError && <p className="text-xs text-[#E24B4A] mt-1">{scError}</p>}
+            </div>
+          </div>
+          <button
+            className="bg-[#534AB7] text-white rounded-lg px-6 py-2.5 text-sm font-medium hover:bg-[#4239a0] cursor-pointer"
+            onClick={startGame}
+          >
+            시작하기
+          </button>
         </div>
+      )}
+
+      {/* STEP 2: 사다리 선택 */}
+      {step === 'select' && (
         <div>
-          <label className="text-sm text-[#666] block mb-1">다리 밀도: {density}</label>
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-sm text-[#666]">어느 사다리를 선택하시겠어요? 상단 번호를 클릭하세요.</p>
+            <button className="text-sm text-[#534AB7] hover:underline" onClick={() => setStep('setup')}>← 설정으로</button>
+          </div>
+          <canvas ref={canvasRef} width={CW} height={CH}
+            className="rounded-xl border border-black/10 bg-[#fafaf8] w-full cursor-pointer"
+            onClick={handleCanvasClick} />
+          <div className="mt-4 flex items-center justify-between">
+            <p className="text-sm text-[#666]">
+              선택된 사다리:{' '}
+              <strong className="text-[#534AB7]">
+                {selectedIdx !== null ? `${selectedIdx + 1}번` : '없음'}
+              </strong>
+            </p>
+            <button
+              className="bg-[#534AB7] text-white rounded-lg px-5 py-2 text-sm font-medium hover:bg-[#4239a0] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+              onClick={confirmSelection} disabled={selectedIdx === null}
+            >
+              선택 확정
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* STEP 2.5: 시뮬레이션 중 */}
+      {step === 'simulating' && (
+        <div>
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-sm font-semibold text-[#534AB7]">
+              시뮬레이션 중... {animProg.cur} / {animProg.total}회
+            </p>
+            <button
+              className="text-sm text-[#534AB7] hover:underline cursor-pointer"
+              onClick={skipAnimation}
+            >
+              건너뛰기 →
+            </button>
+          </div>
+          <canvas ref={canvasRef} width={CW} height={CH}
+            className="rounded-xl border border-black/10 bg-[#fafaf8] w-full" />
+          <div className="mt-3 bg-[#eee] rounded-full h-2 overflow-hidden">
+            <div
+              className="h-full rounded-full bg-[#534AB7]"
+              style={{ width: `${(animProg.cur / animProg.total) * 100}%`, transition: 'width 0.1s linear' }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* STEP 3: 결과 */}
+      {step === 'result' && (
+        <div>
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-sm text-[#666]">
+              <strong className="text-[#111]">{selectedIdx !== null ? `${selectedIdx + 1}번` : '?'}</strong> 사다리 ·{' '}
+              {simCount.toLocaleString()}회 시뮬레이션
+            </p>
+            <button className="text-sm text-[#534AB7] hover:underline" onClick={() => setStep('select')}>← 선택으로</button>
+          </div>
+
+          <div className="flex gap-6 flex-wrap items-start mb-6">
+            <canvas ref={canvasRef} width={CW} height={CH}
+              className="rounded-xl border border-black/10 bg-[#fafaf8] shrink-0"
+              style={{ maxWidth: CW }} />
+
+            <div className="flex-1 min-w-[180px] space-y-4">
+              <div className="bg-[#EEEDFE] rounded-xl p-4">
+                <p className="text-xs text-[#666] mb-1">가장 많이 나온 곳</p>
+                <p className="text-xl font-bold text-[#534AB7]">{topIdx + 1}번 ({maxCount}회)</p>
+              </div>
+              <div className="space-y-2">
+                {chartData.map(({ name, count }) => (
+                  <div key={name} className="flex items-center gap-2">
+                    <span className="text-xs w-8 text-[#666]">{name}</span>
+                    <div className="flex-1 bg-[#eee] rounded h-4 overflow-hidden">
+                      <div className="h-full rounded"
+                        style={{ width: `${simCount > 0 ? (count / simCount) * 100 : 0}%`, background: '#534AB7' }} />
+                    </div>
+                    <span className="text-xs text-[#666] w-10 text-right">
+                      {simCount > 0 ? Math.round((count / simCount) * 100) : 0}%
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="mb-6">
+            <p className="text-sm text-[#666] mb-2">도착지별 횟수</p>
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={chartData} margin={{ top: 5, right: 20, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.08)" />
+                <XAxis dataKey="name" tick={{ fontSize: 12 }} />
+                <YAxis tick={{ fontSize: 12 }} />
+                <Tooltip />
+                <ReferenceLine y={theoreticalAvg} stroke="#aaa" strokeDasharray="5 3"
+                  label={{ value: `이론값 ${theoreticalAvg.toFixed(1)}`, fill: '#999', fontSize: 11, position: 'right' }} />
+                <Bar dataKey="count" name="횟수" radius={[4, 4, 0, 0]}>
+                  {chartData.map((entry, i) => (
+                    <Cell key={i} fill={entry.isMax ? '#534AB7' : '#EEEDFE'} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+
           <div className="flex gap-2">
-            {(['낮음', '중간', '높음'] as Density[]).map((d) => (
-              <button key={d} onClick={() => setDensity(d)}
-                className={`px-3 py-1 rounded text-sm border ${density === d ? 'bg-[#534AB7] text-white border-[#534AB7]' : 'border-black/15 hover:bg-[#f0f0f0]'}`}>
-                {d}
-              </button>
-            ))}
+            <button className={BTN} onClick={() => setStep('setup')}>설정으로</button>
+            <button className={BTN} onClick={() => {
+              setFixedBridges(generateLadder(ladderCount));
+              setDestinations(makeShuffled(ladderCount));
+              setSelectedIdx(null);
+              setStep('select');
+            }}>다시하기</button>
           </div>
         </div>
-      </div>
-      <div className="flex gap-2 mb-4">
-        <button className={BTN} onClick={generate}>사다리 생성</button>
-        {bridges.length > 0 && <button className={BTN} onClick={showAll}>전체 결과 보기</button>}
-      </div>
-      {bridges.length > 0 && (
-        <>
-          <div className="flex gap-2 mb-2 flex-wrap">
-            {Array.from({ length: players }, (_, i) => (
-              <button key={i} onClick={() => selectPlayer(i)}
-                className={`px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${
-                  selectedPlayer === i ? 'bg-[#534AB7] text-white border-[#534AB7]' : 'border-black/15 hover:bg-[#f0f0f0]'
-                }`}>
-                {i + 1}번
-              </button>
-            ))}
-          </div>
-          <canvas ref={canvasRef} width={560} height={340}
-            className="w-full rounded-xl border border-black/10 bg-[#f8f8f6]" />
-        </>
       )}
     </SimLayout>
   );

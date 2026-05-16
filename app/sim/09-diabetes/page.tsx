@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import SimLayout from '@/components/SimLayout';
 import { rand } from '@/lib/rng';
 
@@ -30,18 +30,45 @@ function spinRoulette(key: RouletteKey): Color {
 const COLOR_MAP: Record<Color, string> = { 빨강: '#ef4444', 파랑: '#3b82f6', 초록: '#10b981' };
 
 function RouletteViz({ label, probs }: { label: string; probs: Record<Color, number> }) {
+  const cx = 50, cy = 50, r = 44;
+  let startAngle = -Math.PI / 2;
+
+  const segments = (Object.entries(probs) as [Color, number][]).map(([color, p]) => {
+    const sweep = p * 2 * Math.PI;
+    const endAngle = startAngle + sweep;
+    const x1 = cx + r * Math.cos(startAngle);
+    const y1 = cy + r * Math.sin(startAngle);
+    const x2 = cx + r * Math.cos(endAngle);
+    const y2 = cy + r * Math.sin(endAngle);
+    const mid = startAngle + sweep / 2;
+    const lx = cx + r * 0.62 * Math.cos(mid);
+    const ly = cy + r * 0.62 * Math.sin(mid);
+    const largeArc = sweep > Math.PI ? 1 : 0;
+    const path = `M ${cx} ${cy} L ${x1.toFixed(2)} ${y1.toFixed(2)} A ${r} ${r} 0 ${largeArc} 1 ${x2.toFixed(2)} ${y2.toFixed(2)} Z`;
+    startAngle = endAngle;
+    return { color, p, path, lx, ly };
+  });
+
   return (
-    <div className="bg-[#f8f8f6] rounded-xl p-4">
+    <div className="bg-[#f8f8f6] rounded-xl p-4 flex flex-col items-center">
       <p className="text-sm font-semibold text-[#111] mb-2">룰렛 {label}</p>
-      <div className="flex h-6 rounded overflow-hidden border border-black/10">
-        {(Object.entries(probs) as [Color, number][]).map(([color, p]) => (
-          <div key={color} style={{ width: `${p * 100}%`, background: COLOR_MAP[color] }}
-            title={`${color}: ${(p * 100).toFixed(0)}%`} />
+      <svg viewBox="0 0 100 100" className="w-28 h-28">
+        {segments.map(({ color, p, path, lx, ly }) => (
+          <g key={color}>
+            <path d={path} fill={COLOR_MAP[color]} stroke="white" strokeWidth="1.2" />
+            {p >= 0.12 && (
+              <text x={lx.toFixed(1)} y={ly.toFixed(1)} textAnchor="middle"
+                dominantBaseline="middle" fontSize="9" fill="white" fontWeight="bold">
+                {(p * 100).toFixed(0)}%
+              </text>
+            )}
+          </g>
         ))}
-      </div>
-      <div className="flex gap-3 mt-2">
+        <circle cx={cx} cy={cy} r={r} fill="none" stroke="white" strokeWidth="1.5" />
+      </svg>
+      <div className="flex gap-2 mt-2 flex-wrap justify-center">
         {(Object.entries(probs) as [Color, number][]).map(([color, p]) => (
-          <span key={color} className="text-xs" style={{ color: COLOR_MAP[color] }}>
+          <span key={color} className="text-xs font-medium" style={{ color: COLOR_MAP[color] }}>
             {color} {(p * 100).toFixed(0)}%
           </span>
         ))}
@@ -98,7 +125,7 @@ export default function RoulettePage() {
               <Tooltip />
               <Bar dataKey="count" name="횟수" radius={[4, 4, 0, 0]}>
                 {data.map((entry, i) => (
-                  <rect key={i} fill={entry.fill} />
+                  <Cell key={i} fill={entry.fill} />
                 ))}
               </Bar>
             </BarChart>
