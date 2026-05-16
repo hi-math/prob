@@ -11,7 +11,7 @@ import { rand } from '@/lib/rng';
 type Bridge = { row: number; col: number };
 type Step = 'setup' | 'select' | 'simulating' | 'result';
 
-const ROWS = 12;
+const ROWS = 20;
 const CW = 480;
 const CH = 400;
 const MX = 50;
@@ -24,26 +24,23 @@ function rowY(r: number): number {
   return MY + r * ((CH - 2 * MY) / ROWS);
 }
 
-function generateLadder(n: number): Bridge[] {
+function generateLadder(n: number, rows: number = ROWS): Bridge[] {
   const bridges: Bridge[] = [];
-  for (let r = 0; r < ROWS; r++) {
-    let c = 0;
-    while (c < n - 1) {
-      if (rand() < 0.45) {
-        if (!bridges.some(b => b.row === r && b.col === c - 1)) {
-          bridges.push({ row: r, col: c });
-          c += 2;
-        } else c++;
-      } else c++;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < n - 1; c++) {
+      const adjacentLeft = bridges.some(b => b.row === r && b.col === c - 1);
+      if (!adjacentLeft && rand() < 0.4) {
+        bridges.push({ row: r, col: c });
+      }
     }
   }
   return bridges;
 }
 
-function tracePath(bridges: Bridge[], startCol: number): number[] {
+function tracePath(bridges: Bridge[], startCol: number, rows: number = ROWS): number[] {
   const path = [startCol];
   let col = startCol;
-  for (let r = 0; r < ROWS; r++) {
+  for (let r = 0; r < rows; r++) {
     const right = bridges.find(b => b.row === r && b.col === col);
     const left  = bridges.find(b => b.row === r && b.col === col - 1);
     if (right) col++;
